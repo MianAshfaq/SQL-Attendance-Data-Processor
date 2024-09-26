@@ -1,162 +1,145 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+import pandas as pd
+import pyodbc
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from tkinter import messagebox, simpledialog
+from tkcalendar import DateEntry
+import tkinter as tk
 
-# C extensions
-*.so
+# Function to connect to the SQL database
+def connect_to_database(server, database, username, password):
+    try:
+        conn_str = f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password};TrustServerCertificate=yes;'
+        conn = pyodbc.connect(conn_str)
+        print("Connected to the SQL database.")
+        return conn
+    except Exception as e:
+        print(f"Connection failed: {e}")
+        return None
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# Retrieve employee list from the SQL database
+def retrieve_employee_list(conn):
+    try:
+        query = "SELECT Badgenumber, Name FROM dbo.USERINFO"
+        cursor = conn.cursor()
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        employees = {row[0]: row[1] for row in rows}
+        print("Employee list retrieved.")
+        return employees
+    except Exception as e:
+        print(f"Employee list retrieval failed: {e}")
+        return {}
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# Retrieve attendance data from the SQL database
+def retrieve_attendance_data(conn, start_date, end_date, selected_ids):
+    try:
+        ids_filter = ''
+        if selected_ids:
+            ids_filter = f"AND USERINFO.Badgenumber IN ({', '.join([f'\'{id.strip()}\'' for id in selected_ids.split(',')])})"
+        
+        query = f"""
+        SELECT CHECKINOUT.USERID, CHECKINOUT.CHECKTIME, CHECKINOUT.CHECKTYPE, USERINFO.Badgenumber, USERINFO.Name AS EmployeeName
+        FROM dbo.CHECKINOUT
+        LEFT JOIN dbo.USERINFO ON CHECKINOUT.USERID = USERINFO.USERID
+        WHERE CHECKINOUT.CHECKTIME >= '{start_date}' AND CHECKINOUT.CHECKTIME < '{end_date}'
+        {ids_filter}
+        """
+        cursor = conn.cursor()
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        columns = [column[0] for column in cursor.description]
+        df = pd.DataFrame.from_records(rows, columns=columns)
+        print("Attendance data retrieved.")
+        return df
+    except Exception as e:
+        print(f"Data retrieval failed: {e}")
+        return None
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# Save attendance data to Excel
+def process_and_save_data(df, file_path):
+    try:
+        if df.empty:
+            print("No attendance data to save.")
+            return
+        
+        df['CHECKTIME'] = pd.to_datetime(df['CHECKTIME'])
+        df['Date'] = df['CHECKTIME'].dt.strftime('%m/%d/%Y')
+        df['Time'] = df['CHECKTIME'].dt.time
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
+        df['Event'] = df.groupby(['USERID', 'Date']).cumcount() + 1
 
-# Translations
-*.mo
-*.pot
+        def map_event(event):
+            event_mapping = {1: 'IN_1', 2: 'OUT_1', 3: 'IN_2', 4: 'OUT_2', 5: 'IN_3', 6: 'OUT_3'}
+            return event_mapping.get(event, f'EXTRA_{event}')
+        
+        df['MappedEvent'] = df['Event'].apply(map_event)
+        df_pivot = df.pivot_table(index=['Date', 'Badgenumber', 'EmployeeName'], columns=['MappedEvent'], values='Time', aggfunc='first')
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+        df_pivot.reset_index(inplace=True)
+        df_pivot.rename(columns={'Badgenumber': 'ID Number', 'Date': 'Date', 'EmployeeName': 'Name'}, inplace=True)
 
-# Flask stuff:
-instance/
-.webassets-cache
+        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+            for employee_id, employee_data in df_pivot.groupby('ID Number'):
+                sheet_name = (f'{employee_data["Name"].iloc[0]}_{employee_id}')[:20]
+                employee_data.to_excel(writer, sheet_name=sheet_name, index=False)
 
-# Scrapy stuff:
-.scrapy
+        print("Data saved to Excel sheets.")
+    except Exception as e:
+        print(f"Data processing and saving failed: {e}")
 
-# Sphinx documentation
-docs/_build/
+# Get date range and selected IDs via a Tkinter popup
+def get_date_range_and_ids(employee_dict):
+    root = tk.Tk()
+    root.withdraw()
 
-# PyBuilder
-.pybuilder/
-target/
+    date_range = {}
+    selected_ids = []
 
-# Jupyter Notebook
-.ipynb_checkpoints
+    def get_data():
+        nonlocal selected_ids
+        date_range['start_date'] = start_cal.get_date().strftime('%Y-%m-%d')
+        date_range['end_date'] = end_cal.get_date().strftime('%Y-%m-%d')
+        selected = listbox.curselection()
+        selected_ids = [listbox.get(i).split(':')[0].strip() for i in selected]
+        root.destroy()
 
-# IPython
-profile_default/
-ipython_config.py
+    popup = tk.Toplevel()
+    popup.title("Select Date Range and Employee IDs")
+    
+    tk.Label(popup, text="Start Date:").grid(row=0, column=0, padx=10, pady=10)
+    start_cal = DateEntry(popup)
+    start_cal.grid(row=0, column=1, padx=10, pady=10)
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    tk.Label(popup, text="End Date:").grid(row=1, column=0, padx=10, pady=10)
+    end_cal = DateEntry(popup)
+    end_cal.grid(row=1, column=1, padx=10, pady=10)
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+    tk.Label(popup, text="Employee IDs:").grid(row=2, column=0, padx=10, pady=10)
+    listbox = tk.Listbox(popup, selectmode=tk.MULTIPLE)
+    for key, value in employee_dict.items():
+        listbox.insert(tk.END, f"{key}: {value}")
+    listbox.grid(row=2, column=1, padx=10, pady=10)
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
+    tk.Button(popup, text="Submit", command=get_data).grid(row=3, column=0, columnspan=2, pady=10)
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#pdm.lock
-#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
-#   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
-.pdm.toml
-.pdm-python
-.pdm-build/
+    root.mainloop()
+    return date_range['start_date'], date_range['end_date'], ','.join(selected_ids)
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+# Main execution
+try:
+    server = '<SQL_SERVER_IP>'
+    database = '<DATABASE_NAME>'
+    username = '<SQL_SERVER_USERNAME>'
+    password = '<SQL_SERVER_PASSWORD>'
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+    conn = connect_to_database(server, database, username, password)
+    if conn:
+        employees = retrieve_employee_list(conn)
+        start_date, end_date, selected_ids = get_date_range_and_ids(employees)
+        df = retrieve_attendance_data(conn, start_date, end_date, selected_ids)
+        if df is not None and not df.empty:
+            process_and_save_data(df, 'attendance_data_v7.xlsx')
+        conn.close()
+except Exception as e:
+    print(f"Error: {e}")
